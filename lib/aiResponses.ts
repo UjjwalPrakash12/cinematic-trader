@@ -1,5 +1,16 @@
-export function getAIResponse(input: string): string {
-  const normalized = input.toLowerCase().trim();
+import { sanitizeText } from "@/lib/sanitize";
+
+const MAX_PROMPT_LENGTH = 1000;
+
+const FALLBACK_RESPONSE =
+  "Current read: mixed momentum with selective high-conviction pockets. Signal: HOLD until your target asset confirms trend continuation or reversal. Confidence: 71%.";
+
+export function getAIResponse(input: unknown): string {
+  // Defensive guard — never trust caller-supplied input even within the same process.
+  const safe = sanitizeText(input, { maxLength: MAX_PROMPT_LENGTH, allowNewlines: true });
+  if (safe.length === 0) return FALLBACK_RESPONSE;
+
+  const normalized = safe.toLowerCase();
 
   if (normalized.includes("btc") || normalized.includes("bitcoin")) {
     return "BTC signal: BUY. Reasoning: trend structure remains bullish with steady demand and healthy pullback behavior near support bands. Confidence: 87%.";
@@ -26,5 +37,5 @@ export function getAIResponse(input: string): string {
     return "Market overview: risk appetite is selective, with strongest flows in AI leadership and resilient index components. Signal: mixed bullish bias with strict risk control. Confidence: 78%.";
   }
 
-  return "Current read: mixed momentum with selective high-conviction pockets. Signal: HOLD until your target asset confirms trend continuation or reversal. Confidence: 71%.";
+  return FALLBACK_RESPONSE;
 }

@@ -6,12 +6,17 @@ import { X } from "lucide-react";
 import { formatPercent, formatPrice } from "@/lib/formatters";
 import { useMarketData } from "@/hooks/useMarketData";
 import { getAIResponse } from "@/lib/aiResponses";
+import { sanitizeText, looksLikeHtmlPayload } from "@/lib/sanitize";
 import type { Message } from "@/types/chat";
 
 type AIPanelProps = {
   isOpen: boolean;
   onClose: () => void;
 };
+
+const MAX_PROMPT_LENGTH = 1000;
+const CLIENT_RATE_WINDOW_MS = 60_000;
+const CLIENT_RATE_MAX = 20;
 
 const WELCOME_MESSAGE: Message = {
   id: "ai-welcome",
@@ -55,9 +60,18 @@ export default function AIPanel({ isOpen, onClose }: AIPanelProps) {
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const listEndRef = useRef<HTMLDivElement>(null);
   const typingTimerRef = useRef<number | null>(null);
+  const recentSendsRef = useRef<number[]>([]);
   const { data: marketData } = useMarketData();
 
   const canSend = useMemo(() => input.trim().length > 0 && !isTyping, [input, isTyping]);
+
+  const handleInputChange = useCallback(
+    (event: React.ChangeEvent<HTMLTextAreaElement>) => {
+      const next = event.target.value;
+      setInput(next.length > MAX_PROMPT_LENGTH ? next.slice(0, MAX_PROMPT_LENGTH) : next);
+    },
+    []
+  );
 
   const buildAIResponse = useCallback(
     (prompt: string): string => {
@@ -117,14 +131,49 @@ Signal: ${live.signal} with ${Math.round(live.confidence)}% confidence.`;
     };
   }, [isOpen]);
 
+  const pushAiMessage = useCallback((content: string) => {
+    const aiMessage: Message = {
+      id: `ai-${Date.now()}`,
+      role: "ai",
+      content,
+      createdAt: Date.now(),
+    };
+    setMessages((prev) => [...prev, aiMessage]);
+  }, []);
+
   const sendMessage = useCallback(() => {
     if (!canSend) return;
-    const prompt = input.trim();
+
+    // Client-side input validation (defense-in-depth — server must validate too).
+    const sanitized = sanitizeText(input, {
+      maxLength: MAX_PROMPT_LENGTH,
+      allowNewlines: true,
+    });
+    if (sanitized.length === 0) {
+      setInput("");
+      return;
+    }
+    if (looksLikeHtmlPayload(sanitized)) {
+      setInput("");
+      pushAiMessage("That message contains content I can't process. Please rephrase.");
+      return;
+    }
+
+    // Client-side rate limit to prevent local spamming / accidental loops.
+    const now = Date.now();
+    const recent = recentSendsRef.current.filter((t) => now - t < CLIENT_RATE_WINDOW_MS);
+    if (recent.length >= CLIENT_RATE_MAX) {
+      pushAiMessage("You're sending messages too quickly. Please wait a moment and try again.");
+      return;
+    }
+    recent.push(now);
+    recentSendsRef.current = recent;
+
     const userMessage: Message = {
-      id: `user-${Date.now()}`,
+      id: `user-${now}`,
       role: "user",
-      content: prompt,
-      createdAt: Date.now(),
+      content: sanitized,
+      createdAt: now,
     };
 
     setMessages((prev) => [...prev, userMessage]);
@@ -137,16 +186,15 @@ Signal: ${live.signal} with ${Math.round(live.confidence)}% confidence.`;
     }
 
     typingTimerRef.current = window.setTimeout(() => {
-      const aiMessage: Message = {
-        id: `ai-${Date.now()}`,
-        role: "ai",
-        content: buildAIResponse(prompt),
-        createdAt: Date.now(),
-      };
-      setMessages((prev) => [...prev, aiMessage]);
-      setIsTyping(false);
+      try {
+        pushAiMessage(buildAIResponse(sanitized));
+      } catch {
+        pushAiMessage("Something went wrong while generating a response. Please try again.");
+      } finally {
+        setIsTyping(false);
+      }
     }, 700);
-  }, [buildAIResponse, canSend, input]);
+  }, [buildAIResponse, canSend, input, pushAiMessage]);
 
   const onKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -225,11 +273,15 @@ Signal: ${live.signal} with ${Math.round(live.confidence)}% confidence.`;
             <div className="rounded-2xl border border-white/15 bg-black/40 p-2 focus-within:border-accent-blue/70 focus-within:shadow-[0_0_0_1px_rgba(59,130,246,0.35)]">
               <textarea
                 value={input}
-                onChange={(event) => setInput(event.target.value)}
+                onChange={handleInputChange}
                 onKeyDown={onKeyDown}
                 rows={2}
+                maxLength={MAX_PROMPT_LENGTH}
                 placeholder="Ask about BTC, NVDA, NIFTY..."
                 aria-label="Ask AI trader"
+                autoComplete="off"
+                autoCorrect="off"
+                spellCheck={false}
                 className="ai-scrollbar max-h-40 min-h-[44px] w-full resize-none bg-transparent px-2 py-1 text-sm text-white outline-none placeholder:text-text-secondary"
               />
               <div className="flex justify-end">

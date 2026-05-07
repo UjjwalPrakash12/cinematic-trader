@@ -1,6 +1,13 @@
 import { NextResponse } from "next/server";
 import { getAllMarketData } from "@/lib/server/marketData";
 import { calculateIndicators } from "@/lib/server/indicators";
+import {
+  RATE_LIMIT_PRESETS,
+  checkRateLimit,
+  getClientIdentifier,
+  rateLimitHeaders,
+} from "@/lib/server/rateLimit";
+import { apiErrorResponse, apiSuccessHeaders } from "@/lib/server/apiError";
 
 export const dynamic = "force-dynamic";
 
@@ -14,8 +21,8 @@ interface APIAsset {
   change: number;
   changePercent: number;
   rsi: number;
-  rsiInterpretation: "OVERSOLD" | "OVERBOUGHT" | "NEUTRAL";
-  macdTrend: "BULLISH" | "BEARISH" | "NEUTRAL";
+  rsiInterpretation: RSIInterpretation;
+  macdTrend: MACDTrend;
   signal: Signal;
   confidence: number;
   updatedAt: number;
@@ -59,11 +66,9 @@ function generateSignal(
 ): { signal: Signal; confidence: number } {
   let score = 0;
 
-  // RSI logic
   if (rsi < 30) score += 2;
   else if (rsi > 70) score -= 2;
 
-  // MACD logic
   if (macdTrend === "BULLISH") score += 1;
   else if (macdTrend === "BEARISH") score -= 1;
 
@@ -80,14 +85,32 @@ function generateSignal(
   return { signal, confidence };
 }
 
-export async function GET() {
+export async function GET(request: Request) {
+  const identifier = getClientIdentifier(request);
+  const limit = await checkRateLimit(identifier, {
+    ...RATE_LIMIT_PRESETS.publicRead,
+    namespace: "market",
+  });
+  const limitHeaders = rateLimitHeaders(limit);
+  if (!limit.allowed) {
+    return apiErrorResponse("rate-limited", {
+      status: 429,
+      publicMessage: "Too many requests. Please slow down.",
+      headers: limitHeaders,
+    });
+  }
+
+  console.info("[market] GET /api/market called");
+
   try {
     const result = await getAllMarketData();
 
     const assets: APIAsset[] = [];
     const errors: { symbol: string; error: string }[] = result.errors.map((entry) => ({
       symbol: normalizeAssetSymbol(entry.symbol),
-      error: entry.error || `Failed to fetch market data for ${normalizeAssetSymbol(entry.symbol)}`,
+      // Generic, non-leaky public message — upstream provider details are
+      // logged server-side via the marketData module, not echoed to clients.
+      error: `Failed to fetch market data for ${normalizeAssetSymbol(entry.symbol)}.`,
     }));
 
     for (const item of result.assets) {
@@ -95,7 +118,8 @@ export async function GET() {
         const history = Array.isArray(item.history)
           ? item.history.filter((n) => Number.isFinite(n))
           : [];
-        const safeHistory = history.length >= 2 ? history : [safeNumber(item.previousClose), safeNumber(item.price)];
+        const safeHistory =
+          history.length >= 2 ? history : [safeNumber(item.previousClose), safeNumber(item.price)];
 
         const indicators = calculateIndicators(safeHistory);
 
@@ -119,12 +143,11 @@ export async function GET() {
         });
       } catch (err) {
         const symbol = normalizeAssetSymbol(item.displaySymbol);
+        // Log the underlying cause server-side; surface only a safe message.
+        console.error(`[market] indicator processing failed for ${symbol}`, err);
         errors.push({
           symbol,
-          error:
-            err instanceof Error
-              ? `Failed to process indicators for ${symbol}: ${err.message}`
-              : `Failed to process indicators for ${symbol}`,
+          error: `Failed to process indicators for ${symbol}.`,
         });
       }
     }
@@ -137,17 +160,46 @@ export async function GET() {
       },
       {
         status: 200,
-        headers: {
-          "Cache-Control": "no-store",
-        },
+        headers: apiSuccessHeaders(limitHeaders),
       }
     );
-  } catch {
-    return NextResponse.json(
-      {
-        error: "Failed to fetch market data",
-      },
-      { status: 500 }
-    );
+  } catch (err) {
+    return apiErrorResponse(err, {
+      status: 500,
+      publicMessage: "Failed to fetch market data.",
+      headers: limitHeaders,
+    });
   }
+}
+
+export async function POST() {
+  return apiErrorResponse("method-not-allowed", {
+    status: 405,
+    publicMessage: "Method not allowed.",
+    headers: { Allow: "GET" },
+  });
+}
+
+export async function PUT() {
+  return apiErrorResponse("method-not-allowed", {
+    status: 405,
+    publicMessage: "Method not allowed.",
+    headers: { Allow: "GET" },
+  });
+}
+
+export async function DELETE() {
+  return apiErrorResponse("method-not-allowed", {
+    status: 405,
+    publicMessage: "Method not allowed.",
+    headers: { Allow: "GET" },
+  });
+}
+
+export async function PATCH() {
+  return apiErrorResponse("method-not-allowed", {
+    status: 405,
+    publicMessage: "Method not allowed.",
+    headers: { Allow: "GET" },
+  });
 }
