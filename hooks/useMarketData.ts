@@ -1,10 +1,56 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import type { MarketAPIResponse } from "@/types/market";
+import type { MarketAPIResponse, MarketAsset } from "@/types/market";
 
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
+const VALID_SYMBOLS = new Set(["BTC", "ETH", "AAPL", "NVDA", "TSLA", "NIFTY", "GOLD"]);
+
+function safeFinite(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeAsset(raw: unknown): MarketAsset | null {
+  if (!isObject(raw)) return null;
+  const symbol = typeof raw.symbol === "string" ? raw.symbol : "";
+  if (!VALID_SYMBOLS.has(symbol)) return null;
+
+  const rsiInterpretation =
+    raw.rsiInterpretation === "OVERSOLD" ||
+    raw.rsiInterpretation === "OVERBOUGHT" ||
+    raw.rsiInterpretation === "NEUTRAL"
+      ? raw.rsiInterpretation
+      : "NEUTRAL";
+
+  const macdTrend =
+    raw.macdTrend === "BULLISH" || raw.macdTrend === "BEARISH" || raw.macdTrend === "NEUTRAL"
+      ? raw.macdTrend
+      : "NEUTRAL";
+
+  const signal =
+    raw.signal === "STRONG BUY" ||
+    raw.signal === "BUY" ||
+    raw.signal === "HOLD" ||
+    raw.signal === "SELL" ||
+    raw.signal === "AVOID"
+      ? raw.signal
+      : "HOLD";
+
+  return {
+    symbol,
+    price: safeFinite(raw.price, 0),
+    change: safeFinite(raw.change, 0),
+    changePercent: safeFinite(raw.changePercent, 0),
+    rsi: safeFinite(raw.rsi, 50),
+    rsiInterpretation,
+    macdTrend,
+    signal,
+    confidence: safeFinite(raw.confidence, 0),
+    updatedAt: safeFinite(raw.updatedAt, Date.now()),
+  };
 }
 
 async function fetchMarketData(): Promise<MarketAPIResponse> {
@@ -14,26 +60,28 @@ async function fetchMarketData(): Promise<MarketAPIResponse> {
   }
 
   const data: unknown = await response.json();
-  const parsed = data as MarketAPIResponse;
-  if (!parsed || !Array.isArray(parsed.assets)) {
+  if (!isObject(data) || !Array.isArray(data.assets)) {
     throw new Error("Invalid market data payload");
   }
 
-  const assets = parsed.assets.filter(
-    (asset) =>
-      typeof asset?.symbol === "string" &&
-      isFiniteNumber(asset.price) &&
-      isFiniteNumber(asset.change) &&
-      isFiniteNumber(asset.changePercent) &&
-      isFiniteNumber(asset.rsi) &&
-      isFiniteNumber(asset.confidence) &&
-      isFiniteNumber(asset.updatedAt)
-  );
+  // Be permissive: never silently drop a card. Any missing / non-finite numeric
+  // field is coerced to a safe default so the UI keeps rendering even if the
+  // server returns a partial fallback object for that asset.
+  const assets = data.assets
+    .map((entry) => normalizeAsset(entry))
+    .filter((entry): entry is MarketAsset => entry !== null);
+
+  const errors = Array.isArray(data.errors)
+    ? data.errors.filter(
+        (entry): entry is { symbol: string; error: string } =>
+          isObject(entry) && typeof entry.symbol === "string" && typeof entry.error === "string"
+      )
+    : [];
 
   return {
     assets,
-    errors: Array.isArray(parsed.errors) ? parsed.errors : [],
-    updatedAt: isFiniteNumber(parsed.updatedAt) ? parsed.updatedAt : Date.now(),
+    errors,
+    updatedAt: safeFinite(data.updatedAt, Date.now()),
   };
 }
 

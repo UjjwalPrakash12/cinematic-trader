@@ -12,6 +12,7 @@ export interface NormalizedMarketData {
   changePercent: number;
   history: number[];
   updatedAt: number;
+  isFallback?: boolean;
 }
 
 export interface MarketDataError {
@@ -20,6 +21,10 @@ export interface MarketDataError {
 }
 
 const CACHE_TTL = 30_000;
+const FETCH_TIMEOUT_MS = 10_000;
+
+// Mock-safe fallback history per spec. Used only when upstream is unavailable.
+const FALLBACK_HISTORY: ReadonlyArray<number> = [100, 101, 102, 101, 103];
 
 const cache = new Map<
   string,
@@ -113,6 +118,7 @@ function buildSafeMarketData(
     changePercent: safeChangePercent,
     history: safeHistory,
     updatedAt: safeNumber(input.updatedAt, Date.now()),
+    isFallback: input.isFallback ?? false,
   };
 }
 
@@ -129,14 +135,30 @@ function buildFallbackMarketData(
     previousClose: 0,
     change: 0,
     changePercent: 0,
-    history: [0, 0],
+    history: [...FALLBACK_HISTORY],
     updatedAt: Date.now(),
+    isFallback: true,
   });
 }
 
 function errorMessage(prefix: string, displaySymbol: string, detail?: string): string {
   return `${prefix} for ${displaySymbol}${detail ? `: ${detail}` : ""}`;
 }
+
+async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal, cache: "no-store" });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const COMMON_HEADERS: Record<string, string> = {
+  "User-Agent": "Mozilla/5.0",
+  Accept: "application/json",
+};
 
 async function withCache(
   key: string,
@@ -171,40 +193,93 @@ export async function getYahooMarketData(
       yahooSymbol
     )}?range=1mo&interval=1d`;
 
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        Accept: "application/json",
-      },
-    });
+    const response = await fetchWithTimeout(url, { headers: COMMON_HEADERS });
 
     if (!response.ok) {
       throw new Error(
-        errorMessage("Failed to fetch Yahoo data", displaySymbol, `status ${response.status}`)
+        errorMessage("Yahoo HTTP error", displaySymbol, `status ${response.status}`)
       );
     }
 
-    const payload: unknown = await response.json();
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch (err) {
+      throw new Error(
+        errorMessage(
+          "Invalid Yahoo JSON",
+          displaySymbol,
+          err instanceof Error ? err.message : "parse failed"
+        )
+      );
+    }
+
     const chart = payload as {
       chart?: {
         result?: Array<{
-          meta?: { regularMarketPrice?: unknown; previousClose?: unknown };
+          meta?: {
+            regularMarketPrice?: unknown;
+            previousClose?: unknown;
+            chartPreviousClose?: unknown;
+          };
           indicators?: { quote?: Array<{ close?: unknown[] }> };
         }>;
+        error?: { description?: string; code?: string } | null;
       };
     };
 
+    if (chart.chart?.error) {
+      const detail = chart.chart.error.description ?? chart.chart.error.code ?? "upstream error";
+      throw new Error(errorMessage("Yahoo upstream error", displaySymbol, detail));
+    }
+
     const result = Array.isArray(chart.chart?.result) ? chart.chart?.result?.[0] : undefined;
     const meta = result?.meta;
-    const quote = Array.isArray(result?.indicators?.quote) ? result?.indicators?.quote?.[0] : undefined;
+    const quote = Array.isArray(result?.indicators?.quote)
+      ? result?.indicators?.quote?.[0]
+      : undefined;
+
     if (!result || !meta) {
       throw new Error(errorMessage("Invalid Yahoo response shape", displaySymbol));
     }
 
-    const price = safeNumber(meta.regularMarketPrice, Number.NaN);
-    const previousClose = safeNumber(meta.previousClose, Number.NaN);
-    if (!Number.isFinite(price) || !Number.isFinite(previousClose)) {
-      throw new Error(errorMessage("Invalid Yahoo price fields", displaySymbol));
+    // Build a clean numeric history from the chart "close" series first; we
+    // need it for both price-fallback and previous-close-fallback paths.
+    const rawCloses = Array.isArray(quote?.close) ? (quote!.close as unknown[]) : [];
+    const cleanCloses = rawCloses
+      .map((p) => safeNumber(p, Number.NaN))
+      .filter((p) => Number.isFinite(p));
+
+    // Price preference order:
+    //   1. meta.regularMarketPrice
+    //   2. last close in the history series
+    let price = safeNumber(meta.regularMarketPrice, Number.NaN);
+    if (!Number.isFinite(price) && cleanCloses.length > 0) {
+      price = cleanCloses[cleanCloses.length - 1];
+    }
+
+    // Previous-close preference order. Yahoo's 1mo/1d response typically
+    // populates only `chartPreviousClose` (which represents ~30 days ago, not
+    // yesterday) — that was the root-cause bug behind every Yahoo asset
+    // returning zeros. We prefer day-over-day, falling back to the chart
+    // window only as a last resort:
+    //   1. meta.previousClose                          (day-over-day, ideal)
+    //   2. second-to-last close in history             (day-over-day, derived)
+    //   3. meta.chartPreviousClose                     (~1 month, last resort)
+    //   4. price                                       (so change=0 not NaN)
+    let previousClose = safeNumber(meta.previousClose, Number.NaN);
+    if (!Number.isFinite(previousClose) && cleanCloses.length >= 2) {
+      previousClose = cleanCloses[cleanCloses.length - 2];
+    }
+    if (!Number.isFinite(previousClose)) {
+      previousClose = safeNumber(meta.chartPreviousClose, Number.NaN);
+    }
+    if (!Number.isFinite(previousClose)) {
+      previousClose = price;
+    }
+
+    if (!Number.isFinite(price)) {
+      throw new Error(errorMessage("Yahoo missing price", displaySymbol));
     }
 
     return buildSafeMarketData({
@@ -215,10 +290,53 @@ export async function getYahooMarketData(
       previousClose,
       change: price - previousClose,
       changePercent: previousClose !== 0 ? ((price - previousClose) / previousClose) * 100 : 0,
-      history: quote?.close ?? [],
+      history: cleanCloses,
       updatedAt: Date.now(),
     });
   });
+}
+
+interface CoinGeckoBatchEntry {
+  usd?: unknown;
+  usd_24h_change?: unknown;
+}
+type CoinGeckoBatchPayload = Record<string, CoinGeckoBatchEntry>;
+
+let coingeckoBatchInFlight: Promise<CoinGeckoBatchPayload> | null = null;
+let coingeckoBatchCache: { data: CoinGeckoBatchPayload; timestamp: number } | null = null;
+
+/**
+ * Batched CoinGecko price fetch — single round-trip for all coins, cached for
+ * `CACHE_TTL`. Reduces the chance of hitting the public API's 50 req/min
+ * rate limit.
+ */
+async function fetchCoinGeckoPriceBatch(coinIds: ReadonlyArray<string>): Promise<CoinGeckoBatchPayload> {
+  const now = Date.now();
+  if (coingeckoBatchCache && now - coingeckoBatchCache.timestamp < CACHE_TTL) {
+    return coingeckoBatchCache.data;
+  }
+  if (coingeckoBatchInFlight) return coingeckoBatchInFlight;
+
+  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinIds.join(
+    ","
+  )}&vs_currencies=usd&include_24hr_change=true`;
+
+  coingeckoBatchInFlight = (async () => {
+    const response = await fetchWithTimeout(url, { headers: COMMON_HEADERS });
+    if (response.status === 429) {
+      throw new Error("CoinGecko rate limited (429)");
+    }
+    if (!response.ok) {
+      throw new Error(`CoinGecko price HTTP ${response.status}`);
+    }
+    const payload = (await response.json()) as CoinGeckoBatchPayload;
+    coingeckoBatchCache = { data: payload, timestamp: Date.now() };
+    return payload;
+  })().finally(() => {
+    coingeckoBatchInFlight = null;
+  });
+
+  return coingeckoBatchInFlight;
 }
 
 export async function getCoinGeckoMarketData(
@@ -227,64 +345,54 @@ export async function getCoinGeckoMarketData(
 ): Promise<NormalizedMarketData> {
   const cacheKey = `coingecko:${coinId}`;
   return withCache(cacheKey, async () => {
-    const priceUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd&include_24hr_change=true`;
     const historyUrl = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=30&interval=daily`;
 
-    const [priceResponse, historyResponse] = await Promise.all([
-      fetch(priceUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0",
-          Accept: "application/json",
-        },
-      }),
-      fetch(historyUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0",
-          Accept: "application/json",
-        },
-      }),
+    const [batch, historyResponse] = await Promise.all([
+      fetchCoinGeckoPriceBatch(["bitcoin", "ethereum"]),
+      fetchWithTimeout(historyUrl, { headers: COMMON_HEADERS }),
     ]);
 
-    if (!priceResponse.ok) {
-      throw new Error(
-        errorMessage(
-          "Failed to fetch CoinGecko price data",
-          displaySymbol,
-          `status ${priceResponse.status}`
-        )
-      );
+    if (historyResponse.status === 429) {
+      throw new Error(errorMessage("CoinGecko history rate limited", displaySymbol, "status 429"));
     }
     if (!historyResponse.ok) {
       throw new Error(
         errorMessage(
-          "Failed to fetch CoinGecko history data",
+          "CoinGecko history HTTP error",
           displaySymbol,
           `status ${historyResponse.status}`
         )
       );
     }
 
-    const [pricePayload, historyPayload] = (await Promise.all([
-      priceResponse.json(),
-      historyResponse.json(),
-    ])) as [unknown, unknown];
-
-    const priceData = pricePayload as Record<string, { usd?: unknown; usd_24h_change?: unknown }>;
-    const coinPriceData = priceData?.[coinId];
+    const coinPriceData = batch?.[coinId];
     if (!coinPriceData) {
-      throw new Error(errorMessage("Invalid CoinGecko price response", displaySymbol));
+      throw new Error(errorMessage("CoinGecko missing coin in batch", displaySymbol, coinId));
     }
 
     const price = safeNumber(coinPriceData.usd, Number.NaN);
     const changePercent = safeNumber(coinPriceData.usd_24h_change, Number.NaN);
-    if (!Number.isFinite(price) || !Number.isFinite(changePercent)) {
-      throw new Error(errorMessage("Invalid CoinGecko price fields", displaySymbol));
+    if (!Number.isFinite(price)) {
+      throw new Error(errorMessage("CoinGecko missing price", displaySymbol));
     }
 
-    const denominator = 1 + changePercent / 100;
+    const safeChangePercent = Number.isFinite(changePercent) ? changePercent : 0;
+    const denominator = 1 + safeChangePercent / 100;
     const previousClose = denominator !== 0 ? price / denominator : price;
     const change = price - previousClose;
 
+    let historyPayload: unknown;
+    try {
+      historyPayload = await historyResponse.json();
+    } catch (err) {
+      throw new Error(
+        errorMessage(
+          "Invalid CoinGecko history JSON",
+          displaySymbol,
+          err instanceof Error ? err.message : "parse failed"
+        )
+      );
+    }
     const historyData = historyPayload as { prices?: unknown[] };
     const rawHistory = Array.isArray(historyData?.prices)
       ? historyData.prices.map((entry) => (Array.isArray(entry) ? entry[1] : undefined))
@@ -297,57 +405,50 @@ export async function getCoinGeckoMarketData(
       price,
       previousClose,
       change,
-      changePercent,
+      changePercent: safeChangePercent,
       history: rawHistory,
       updatedAt: Date.now(),
     });
   });
 }
 
+/**
+ * Per-asset fetchers. They DO NOT swallow errors anymore — `getAllMarketData`
+ * uses Promise.allSettled to capture per-asset failures into `errors[]` and
+ * substitute a fallback object so the UI keeps working.
+ */
 export async function getStock(symbol: "AAPL" | "NVDA" | "TSLA"): Promise<NormalizedMarketData> {
-  try {
-    switch (symbol) {
-      case "AAPL":
-        return await getYahooMarketData("AAPL", "AAPL");
-      case "NVDA":
-        return await getYahooMarketData("NVDA", "NVDA");
-      case "TSLA":
-        return await getYahooMarketData("TSLA", "TSLA");
-      default:
-        return buildFallbackMarketData(symbol, symbol, "yahoo");
-    }
-  } catch {
-    return buildFallbackMarketData(symbol, symbol, "yahoo");
+  switch (symbol) {
+    case "AAPL":
+      return getYahooMarketData("AAPL", "AAPL");
+    case "NVDA":
+      return getYahooMarketData("NVDA", "NVDA");
+    case "TSLA":
+      return getYahooMarketData("TSLA", "TSLA");
+    default:
+      throw new Error(`Unsupported stock symbol: ${String(symbol)}`);
   }
 }
 
 export async function getIndex(symbol: "NIFTY" | "GOLD"): Promise<NormalizedMarketData> {
-  try {
-    switch (symbol) {
-      case "NIFTY":
-        return await getYahooMarketData("^NSEI", "NIFTY");
-      case "GOLD":
-        return await getYahooMarketData("GC=F", "GOLD");
-      default:
-        return buildFallbackMarketData(symbol, symbol, "yahoo");
-    }
-  } catch {
-    return buildFallbackMarketData(symbol, symbol, "yahoo");
+  switch (symbol) {
+    case "NIFTY":
+      return getYahooMarketData("^NSEI", "NIFTY");
+    case "GOLD":
+      return getYahooMarketData("GC=F", "GOLD");
+    default:
+      throw new Error(`Unsupported index symbol: ${String(symbol)}`);
   }
 }
 
 export async function getCrypto(symbol: "BTC" | "ETH"): Promise<NormalizedMarketData> {
-  try {
-    switch (symbol) {
-      case "BTC":
-        return await getCoinGeckoMarketData("bitcoin", "BTC");
-      case "ETH":
-        return await getCoinGeckoMarketData("ethereum", "ETH");
-      default:
-        return buildFallbackMarketData(symbol, symbol, "coingecko");
-    }
-  } catch {
-    return buildFallbackMarketData(symbol, symbol, "coingecko");
+  switch (symbol) {
+    case "BTC":
+      return getCoinGeckoMarketData("bitcoin", "BTC");
+    case "ETH":
+      return getCoinGeckoMarketData("ethereum", "ETH");
+    default:
+      throw new Error(`Unsupported crypto symbol: ${String(symbol)}`);
   }
 }
 
@@ -378,23 +479,46 @@ export async function getAllMarketData(): Promise<{
   errors: MarketDataError[];
   updatedAt: number;
 }> {
+  const start = Date.now();
   const settled = await Promise.allSettled(MARKET_ASSETS.map((asset) => fetchAsset(asset)));
 
   const assets: NormalizedMarketData[] = [];
   const errors: MarketDataError[] = [];
+  const succeeded: string[] = [];
+  const failed: { symbol: string; error: string }[] = [];
 
   settled.forEach((result, index) => {
     const symbol = MARKET_ASSETS[index].symbol;
     if (result.status === "fulfilled") {
-      assets.push(buildSafeMarketData(result.value));
+      const data = buildSafeMarketData(result.value);
+      assets.push(data);
+      if (data.isFallback) {
+        failed.push({ symbol, error: "served-from-fallback" });
+      } else {
+        succeeded.push(symbol);
+      }
       return;
     }
     const message =
       result.reason instanceof Error ? result.reason.message : "Unknown market data error";
     errors.push({ symbol, error: message });
+    failed.push({ symbol, error: message });
     const source = MARKET_ASSETS[index].type === "crypto" ? "coingecko" : "yahoo";
     assets.push(buildFallbackMarketData(symbol, symbol, source));
   });
+
+  // Temporary debug logging (no secrets) — visible in server logs only.
+  const elapsed = Date.now() - start;
+  console.info(
+    `[market] fetched ${succeeded.length}/${MARKET_ASSETS.length} ok in ${elapsed}ms; ok=[${succeeded.join(
+      ","
+    )}]`
+  );
+  if (failed.length > 0) {
+    for (const f of failed) {
+      console.warn(`[market] ${f.symbol} failed: ${f.error}`);
+    }
+  }
 
   return {
     assets,
